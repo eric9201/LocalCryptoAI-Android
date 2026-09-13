@@ -1,0 +1,406 @@
+name: Build LocalCryptoAI v2 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout bootstrap repo
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK/NDK
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;29.0.13113456"
+
+      - name: Clone llama.cpp
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git llama.cpp
+
+      - name: Bundle Qwen3 4B Instruct IQ3_XS
+        shell: bash
+        run: |
+          mkdir -p llama.cpp/examples/llama.android/app/src/main/assets
+          curl -fL --retry 5 --retry-delay 5 \
+            "https://huggingface.co/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen_Qwen3-4B-Instruct-2507-IQ3_XS.gguf?download=true" \
+            -o llama.cpp/examples/llama.android/app/src/main/assets/local-model.gguf
+          ls -lh llama.cpp/examples/llama.android/app/src/main/assets/local-model.gguf
+
+      - name: Configure LocalCryptoAI v2
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('llama.cpp/examples/llama.android')
+          app_src = root / 'app/src/main'
+          java_dir = app_src / 'java/com/example/llama'
+
+          lib_gradle = root / 'lib/build.gradle.kts'
+          s = lib_gradle.read_text()
+          s = s.replace('abiFilters += listOf("arm64-v8a", "x86_64")', 'abiFilters += listOf("arm64-v8a")')
+          lib_gradle.write_text(s)
+
+          app_gradle = root / 'app/build.gradle.kts'
+          s = app_gradle.read_text()
+          s = s.replace('targetSdk = 36', 'targetSdk = 33')
+          marker = '    compileOptions {'
+          insert = '''    androidResources {\n        noCompress += "gguf"\n    }\n'''
+          if 'noCompress += "gguf"' not in s:
+              s = s.replace(marker, insert + marker)
+          app_gradle.write_text(s)
+
+          strings = app_src / 'res/values/strings.xml'
+          t = strings.read_text()
+          t = re.sub(r'<string name="app_name">.*?</string>', '<string name="app_name">LocalCryptoAI v2</string>', t)
+          strings.write_text(t)
+
+          manifest = app_src / 'AndroidManifest.xml'
+          m = manifest.read_text()
+          perms = '''    <uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n\n'''
+          m = m.replace('    <application', perms + '    <application', 1)
+          service = '''        <service\n            android:name=".LocalAiService"\n            android:exported="false"\n            android:stopWithTask="false" />\n\n'''
+          m = m.replace('        <activity', service + '        <activity', 1)
+          manifest.write_text(m)
+
+          (java_dir / 'LocalAiRuntime.kt').write_text(r'''package com.example.llama
+
+          import android.content.Context
+          import com.arm.aichat.AiChat
+          import com.arm.aichat.InferenceEngine
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.flow.collect
+          import kotlinx.coroutines.sync.Mutex
+          import kotlinx.coroutines.sync.withLock
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.io.FileOutputStream
+
+          object LocalAiRuntime {
+              const val MODEL_ID = "qwen3-4b-instruct-2507-iq3-xs"
+              const val PORT = 8787
+              private const val MODEL_ASSET = "local-model.gguf"
+
+              @Volatile var ready: Boolean = false
+                  private set
+              @Volatile var lastError: String? = null
+                  private set
+
+              private lateinit var engine: InferenceEngine
+              private val mutex = Mutex()
+
+              private const val SYSTEM_PROMPT = """
+          You are LocalCryptoAI, an on-device analysis engine.
+          Be precise, concise, and evidence-driven.
+          Never invent prices, indicators, news, positions, or market data.
+          Treat every structured analysis request as independent and prioritize the current request.
+          When the caller asks for JSON, return strict valid JSON only with no markdown fences.
+          For trading analysis, distinguish observed facts from inference and allow WAIT/NO_TRADE when evidence is insufficient.
+          """
+
+              suspend fun initialize(context: Context) = mutex.withLock {
+                  if (ready) return@withLock
+                  try {
+                      lastError = null
+                      engine = AiChat.getInferenceEngine(context.applicationContext)
+                      val modelFile = ensureBundledModel(context.applicationContext)
+                      engine.loadModel(modelFile.path)
+                      engine.setSystemPrompt(SYSTEM_PROMPT.trimIndent())
+                      ready = true
+                  } catch (t: Throwable) {
+                      lastError = t.message ?: t.javaClass.simpleName
+                      throw t
+                  }
+              }
+
+              suspend fun chat(prompt: String, maxTokens: Int = 512): String = mutex.withLock {
+                  check(ready) { "Local AI is not ready" }
+                  val out = StringBuilder()
+                  engine.sendUserPrompt(prompt, maxTokens.coerceIn(32, 1024)).collect { out.append(it) }
+                  out.toString()
+              }
+
+              private suspend fun ensureBundledModel(context: Context): File = withContext(Dispatchers.IO) {
+                  val dir = File(context.filesDir, "models").apply { mkdirs() }
+                  val file = File(dir, "qwen3-4b-instruct-2507-iq3-xs.gguf")
+                  if (!file.exists() || file.length() < 1_000_000_000L) {
+                      context.assets.open(MODEL_ASSET).use { input ->
+                          FileOutputStream(file).use { output -> input.copyTo(output, 1024 * 1024) }
+                      }
+                  }
+                  file
+              }
+
+              fun destroy() {
+                  if (::engine.isInitialized) runCatching { engine.destroy() }
+                  ready = false
+              }
+          }
+          '''.replace('\n          ', '\n').lstrip())
+
+          (java_dir / 'LocalHttpServer.kt').write_text(r'''package com.example.llama
+
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.runBlocking
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.ByteArrayOutputStream
+          import java.io.InputStream
+          import java.net.InetAddress
+          import java.net.InetSocketAddress
+          import java.net.ServerSocket
+          import java.net.Socket
+          import java.nio.charset.StandardCharsets
+          import java.util.UUID
+          import kotlin.math.min
+
+          class LocalHttpServer(private val port: Int, private val scope: CoroutineScope) {
+              @Volatile private var running = false
+              private var serverSocket: ServerSocket? = null
+
+              fun start() {
+                  if (running) return
+                  running = true
+                  scope.launch(Dispatchers.IO) {
+                      val ss = ServerSocket()
+                      serverSocket = ss
+                      ss.reuseAddress = true
+                      ss.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 16)
+                      while (running) {
+                          try {
+                              val socket = ss.accept()
+                              scope.launch(Dispatchers.IO) { handle(socket) }
+                          } catch (_: Throwable) {
+                              if (!running) break
+                          }
+                      }
+                  }
+              }
+
+              fun stop() {
+                  running = false
+                  runCatching { serverSocket?.close() }
+              }
+
+              private fun handle(socket: Socket) {
+                  socket.use { s ->
+                      try {
+                          s.soTimeout = 120_000
+                          val req = readRequest(s.getInputStream())
+                          val result = route(req.method, req.path, req.body)
+                          writeResponse(s, result.first, result.second)
+                      } catch (t: Throwable) {
+                          writeResponse(s, 500, JSONObject().put("error", JSONObject().put("message", t.message ?: t.javaClass.simpleName).put("type", "local_ai_error")).toString())
+                      }
+                  }
+              }
+
+              private fun route(method: String, path: String, body: String): Pair<Int, String> {
+                  if (method == "GET" && path == "/health") {
+                      return 200 to JSONObject().put("status", if (LocalAiRuntime.ready) "ok" else "loading").put("ready", LocalAiRuntime.ready).put("model", LocalAiRuntime.MODEL_ID).put("port", LocalAiRuntime.PORT).put("error", LocalAiRuntime.lastError).toString()
+                  }
+
+                  if (method == "GET" && path == "/v1/models") {
+                      val model = JSONObject().put("id", LocalAiRuntime.MODEL_ID).put("object", "model").put("owned_by", "local")
+                      return 200 to JSONObject().put("object", "list").put("data", JSONArray().put(model)).toString()
+                  }
+
+                  if (!LocalAiRuntime.ready) {
+                      return 503 to JSONObject().put("error", JSONObject().put("message", "Local AI model is still loading").put("type", "service_unavailable")).toString()
+                  }
+
+                  if (method == "POST" && path == "/v1/chat/completions") {
+                      val json = if (body.isBlank()) JSONObject() else JSONObject(body)
+                      val messages = json.optJSONArray("messages") ?: JSONArray()
+                      val prompt = StringBuilder()
+                      for (i in 0 until messages.length()) {
+                          val msg = messages.optJSONObject(i) ?: continue
+                          val role = msg.optString("role", "user")
+                          val content = msg.optString("content", "")
+                          if (content.isNotBlank()) prompt.append(role.uppercase()).append(":\n").append(content).append("\n\n")
+                      }
+                      if (prompt.isEmpty()) return 400 to JSONObject().put("error", JSONObject().put("message", "messages is empty")).toString()
+                      val maxTokens = json.optInt("max_tokens", 512).coerceIn(32, 1024)
+                      val answer = runBlocking { LocalAiRuntime.chat("Treat this API call as independent from previous calls.\n\n$prompt", maxTokens) }
+                      val message = JSONObject().put("role", "assistant").put("content", answer)
+                      val choice = JSONObject().put("index", 0).put("message", message).put("finish_reason", "stop")
+                      return 200 to JSONObject().put("id", "chatcmpl-local-${UUID.randomUUID()}").put("object", "chat.completion").put("created", System.currentTimeMillis() / 1000).put("model", LocalAiRuntime.MODEL_ID).put("choices", JSONArray().put(choice)).toString()
+                  }
+
+                  if (method == "POST" && path == "/v1/analysis") {
+                      val input = if (body.isBlank()) JSONObject() else JSONObject(body)
+                      val task = input.optString("task", "Analyze the supplied structured data.")
+                      val maxTokens = input.optInt("max_tokens", 512).coerceIn(64, 1024)
+                      val prompt = """
+                          This is an independent structured analysis request.
+                          Task: $task
+                          Input JSON:
+                          ${input}
+
+                          Return strict JSON only.
+                          Recommended top-level keys: decision, confidence, summary, evidence, risks.
+                          Do not invent missing data. Use decision=\"INSUFFICIENT_DATA\" when appropriate.
+                      """.trimIndent()
+                      val answer = runBlocking { LocalAiRuntime.chat(prompt, maxTokens) }
+                      val cleaned = answer.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+                      val parsed: Any = try { JSONObject(cleaned) } catch (_: Throwable) { JSONObject().put("raw", answer) }
+                      return 200 to JSONObject().put("model", LocalAiRuntime.MODEL_ID).put("result", parsed).toString()
+                  }
+
+                  return 404 to JSONObject().put("error", JSONObject().put("message", "Not found")).toString()
+              }
+
+              private data class Request(val method: String, val path: String, val body: String)
+
+              private fun readRequest(input: InputStream): Request {
+                  val headerBytes = ByteArrayOutputStream()
+                  var matched = 0
+                  while (headerBytes.size() < 64 * 1024) {
+                      val b = input.read()
+                      if (b < 0) break
+                      headerBytes.write(b)
+                      matched = when {
+                          matched == 0 && b == '\r'.code -> 1
+                          matched == 1 && b == '\n'.code -> 2
+                          matched == 2 && b == '\r'.code -> 3
+                          matched == 3 && b == '\n'.code -> 4
+                          b == '\r'.code -> 1
+                          else -> 0
+                      }
+                      if (matched == 4) break
+                  }
+                  val header = headerBytes.toString(StandardCharsets.ISO_8859_1.name())
+                  val lines = header.split("\r\n")
+                  val requestLine = lines.firstOrNull()?.split(" ") ?: emptyList()
+                  val method = requestLine.getOrNull(0) ?: "GET"
+                  val path = (requestLine.getOrNull(1) ?: "/").substringBefore("?")
+                  var contentLength = 0
+                  for (line in lines.drop(1)) {
+                      val p = line.indexOf(':')
+                      if (p > 0 && line.substring(0, p).trim().equals("Content-Length", true)) contentLength = line.substring(p + 1).trim().toIntOrNull() ?: 0
+                  }
+                  if (contentLength > 4 * 1024 * 1024) error("Request body too large")
+                  val bodyBytes = ByteArray(contentLength)
+                  var off = 0
+                  while (off < contentLength) {
+                      val n = input.read(bodyBytes, off, contentLength - off)
+                      if (n < 0) break
+                      off += n
+                  }
+                  return Request(method, path, String(bodyBytes, 0, min(off, bodyBytes.size), StandardCharsets.UTF_8))
+              }
+
+              private fun writeResponse(socket: Socket, status: Int, body: String) {
+                  val bytes = body.toByteArray(StandardCharsets.UTF_8)
+                  val reason = when (status) { 200 -> "OK"; 400 -> "Bad Request"; 404 -> "Not Found"; 503 -> "Service Unavailable"; else -> "Internal Server Error" }
+                  val header = buildString {
+                      append("HTTP/1.1 $status $reason\r\n")
+                      append("Content-Type: application/json; charset=utf-8\r\n")
+                      append("Content-Length: ${bytes.size}\r\n")
+                      append("Connection: close\r\n")
+                      append("Access-Control-Allow-Origin: *\r\n")
+                      append("\r\n")
+                  }.toByteArray(StandardCharsets.ISO_8859_1)
+                  socket.getOutputStream().use { out -> out.write(header); out.write(bytes); out.flush() }
+              }
+          }
+          '''.replace('\n          ', '\n').lstrip())
+
+          (java_dir / 'LocalAiService.kt').write_text(r'''package com.example.llama
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.os.IBinder
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancel
+          import kotlinx.coroutines.launch
+
+          class LocalAiService : Service() {
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+              private var server: LocalHttpServer? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  createChannel()
+                  startForeground(1001, buildNotification("Loading Qwen3 4B local model…"))
+                  server = LocalHttpServer(LocalAiRuntime.PORT, scope).also { it.start() }
+                  scope.launch {
+                      try {
+                          LocalAiRuntime.initialize(applicationContext)
+                          getSystemService(NotificationManager::class.java).notify(1001, buildNotification("Local AI ready · API 127.0.0.1:${LocalAiRuntime.PORT}"))
+                      } catch (t: Throwable) {
+                          getSystemService(NotificationManager::class.java).notify(1001, buildNotification("Local AI failed: ${t.message ?: "unknown error"}"))
+                      }
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onDestroy() {
+                  server?.stop()
+                  LocalAiRuntime.destroy()
+                  scope.cancel()
+                  super.onDestroy()
+              }
+
+              private fun createChannel() {
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(CHANNEL_ID, "Local AI Service", NotificationManager.IMPORTANCE_LOW))
+              }
+
+              private fun buildNotification(text: String): Notification {
+                  val pending = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                  return Notification.Builder(this, CHANNEL_ID).setSmallIcon(android.R.drawable.stat_sys_download_done).setContentTitle("LocalCryptoAI v2").setContentText(text).setOngoing(true).setContentIntent(pending).build()
+              }
+
+              companion object { private const val CHANNEL_ID = "local_ai_service" }
+          }
+          '''.replace('\n          ', '\n').lstrip())
+
+          (java_dir / 'MainActivity.kt').write_text(r'''package com.example.llama
+
+          import android.content.Intent
+          import android.os.Bundle
+          import android.widget.EditText
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.addCallback
+          import androidx.activity.enableEdgeToEdge
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.lifecycle.lifecycleScope
+          import androidx.recycler
