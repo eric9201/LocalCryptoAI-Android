@@ -1,0 +1,263 @@
+name: Build LocalCryptoAI APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout bootstrap repo
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK/NDK
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;29.0.13113456"
+
+      - name: Clone llama.cpp
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git llama.cpp
+
+      - name: Bundle Qwen2.5 0.5B Q4_K_M model
+        shell: bash
+        run: |
+          mkdir -p llama.cpp/examples/llama.android/app/src/main/assets
+          curl -fL --retry 5 --retry-delay 3 \
+            "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true" \
+            -o llama.cpp/examples/llama.android/app/src/main/assets/local-model.gguf
+          ls -lh llama.cpp/examples/llama.android/app/src/main/assets/local-model.gguf
+
+      - name: Configure offline bundled-model app
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          root = Path('llama.cpp/examples/llama.android')
+
+          # Keep only arm64-v8a to reduce APK size and target modern Android phones.
+          lib_gradle = root / 'lib/build.gradle.kts'
+          s = lib_gradle.read_text()
+          s = s.replace('abiFilters += listOf("arm64-v8a", "x86_64")', 'abiFilters += listOf("arm64-v8a")')
+          lib_gradle.write_text(s)
+
+          # Keep the large GGUF asset uncompressed inside the APK.
+          app_gradle = root / 'app/build.gradle.kts'
+          s = app_gradle.read_text()
+          marker = '    compileOptions {'
+          insert = '''    androidResources {\n        noCompress += "gguf"\n    }\n'''
+          if 'noCompress += "gguf"' not in s:
+              s = s.replace(marker, insert + marker)
+          app_gradle.write_text(s)
+
+          # Friendly app name.
+          strings = root / 'app/src/main/res/values/strings.xml'
+          if strings.exists():
+              t = strings.read_text()
+              import re
+              t = re.sub(r'<string name="app_name">.*?</string>', '<string name="app_name">LocalCryptoAI</string>', t)
+              strings.write_text(t)
+
+          # Replace sample file-picker UX with automatic loading of the GGUF bundled in assets.
+          main = root / 'app/src/main/java/com/example/llama/MainActivity.kt'
+          main.write_text(r'''package com.example.llama
+
+          import android.os.Bundle
+          import android.util.Log
+          import android.widget.EditText
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.addCallback
+          import androidx.activity.enableEdgeToEdge
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.lifecycle.lifecycleScope
+          import androidx.recyclerview.widget.LinearLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+          import com.arm.aichat.AiChat
+          import com.arm.aichat.InferenceEngine
+          import com.google.android.material.floatingactionbutton.FloatingActionButton
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.flow.onCompletion
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.util.UUID
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var ggufTv: TextView
+              private lateinit var messagesRv: RecyclerView
+              private lateinit var userInputEt: EditText
+              private lateinit var userActionFab: FloatingActionButton
+
+              private lateinit var engine: InferenceEngine
+              private var generationJob: Job? = null
+              private var isModelReady = false
+              private val messages = mutableListOf<Message>()
+              private val lastAssistantMsg = StringBuilder()
+              private val messageAdapter = MessageAdapter(messages)
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge()
+                  setContentView(R.layout.activity_main)
+                  onBackPressedDispatcher.addCallback { finish() }
+
+                  ggufTv = findViewById(R.id.gguf)
+                  messagesRv = findViewById(R.id.messages)
+                  messagesRv.layoutManager = LinearLayoutManager(this).apply { stackFromEnd = true }
+                  messagesRv.adapter = messageAdapter
+                  userInputEt = findViewById(R.id.user_input)
+                  userActionFab = findViewById(R.id.fab)
+
+                  userInputEt.isEnabled = false
+                  userActionFab.isEnabled = false
+                  userInputEt.hint = "正在載入本地 AI…"
+                  ggufTv.text = "LocalCryptoAI · Qwen2.5 0.5B Q4_K_M · 完全離線"
+
+                  lifecycleScope.launch(Dispatchers.Default) {
+                      try {
+                          engine = AiChat.getInferenceEngine(applicationContext)
+                          val modelFile = ensureBundledModel()
+                          engine.loadModel(modelFile.path)
+                          withContext(Dispatchers.Main) {
+                              isModelReady = true
+                              userInputEt.isEnabled = true
+                              userActionFab.isEnabled = true
+                              userInputEt.hint = "輸入訊息…"
+                              userActionFab.setImageResource(R.drawable.outline_send_24)
+                              ggufTv.text = "● 本地模型已載入 · ${(modelFile.length() / 1024 / 1024)} MB · 離線可用"
+                          }
+                      } catch (t: Throwable) {
+                          Log.e(TAG, "Failed to initialize local model", t)
+                          withContext(Dispatchers.Main) {
+                              ggufTv.text = "模型載入失敗：${t.message ?: t.javaClass.simpleName}"
+                              Toast.makeText(this@MainActivity, "模型載入失敗", Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }
+
+                  userActionFab.setOnClickListener {
+                      if (isModelReady) handleUserInput()
+                  }
+              }
+
+              private suspend fun ensureBundledModel(): File = withContext(Dispatchers.IO) {
+                  val modelDir = File(filesDir, "models").apply { mkdirs() }
+                  val modelFile = File(modelDir, "qwen2.5-0.5b-instruct-q4_k_m.gguf")
+                  if (!modelFile.exists() || modelFile.length() < 100_000_000L) {
+                      withContext(Dispatchers.Main) {
+                          userInputEt.hint = "第一次啟動：正在準備內建模型…"
+                      }
+                      assets.open(MODEL_ASSET).use { input ->
+                          FileOutputStream(modelFile).use { output ->
+                              input.copyTo(output, 1024 * 1024)
+                          }
+                      }
+                  }
+                  modelFile
+              }
+
+              private fun handleUserInput() {
+                  val userMsg = userInputEt.text.toString().trim()
+                  if (userMsg.isEmpty()) {
+                      Toast.makeText(this, "請先輸入內容", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+
+                  userInputEt.text = null
+                  userInputEt.isEnabled = false
+                  userActionFab.isEnabled = false
+
+                  messages.add(Message(UUID.randomUUID().toString(), userMsg, true))
+                  messageAdapter.notifyItemInserted(messages.size - 1)
+                  lastAssistantMsg.clear()
+                  messages.add(Message(UUID.randomUUID().toString(), "", false))
+                  messageAdapter.notifyItemInserted(messages.size - 1)
+                  messagesRv.scrollToPosition(messages.size - 1)
+
+                  generationJob = lifecycleScope.launch(Dispatchers.Default) {
+                      engine.sendUserPrompt(userMsg)
+                          .onCompletion {
+                              withContext(Dispatchers.Main) {
+                                  userInputEt.isEnabled = true
+                                  userActionFab.isEnabled = true
+                              }
+                          }
+                          .collect { token ->
+                              withContext(Dispatchers.Main) {
+                                  val i = messages.lastIndex
+                                  val updated = messages[i].copy(content = lastAssistantMsg.append(token).toString())
+                                  messages[i] = updated
+                                  messageAdapter.notifyItemChanged(i)
+                                  messagesRv.scrollToPosition(i)
+                              }
+                          }
+                  }
+              }
+
+              override fun onStop() {
+                  generationJob?.cancel()
+                  super.onStop()
+              }
+
+              override fun onDestroy() {
+                  if (::engine.isInitialized) engine.destroy()
+                  super.onDestroy()
+              }
+
+              companion object {
+                  private val TAG = MainActivity::class.java.simpleName
+                  private const val MODEL_ASSET = "local-model.gguf"
+              }
+          }
+          '''.replace('\n          ', '\n').lstrip())
+          PY
+
+      - name: Build installable arm64 APK
+        shell: bash
+        working-directory: llama.cpp/examples/llama.android
+        env:
+          GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx6g
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/LocalCryptoAI-Qwen0.5B-arm64.apk"
+          ls -lh "$GITHUB_WORKSPACE/LocalCryptoAI-Qwen0.5B-arm64.apk"
+
+      - name: Publish APK as GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="localai-build-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" \
+            "LocalCryptoAI-Qwen0.5B-arm64.apk" \
+            --title "LocalCryptoAI build ${GITHUB_RUN_NUMBER}" \
+            --notes "Offline arm64 Android APK with bundled Qwen2.5-0.5B-Instruct Q4_K_M model. No API key required. The model is copied only to app-private storage; uninstalling the app removes it."
