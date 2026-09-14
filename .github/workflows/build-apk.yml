@@ -1,4 +1,4 @@
-name: Build LocalCryptoAI v2 APK
+name: Build LocalCryptoAI v2.2 Stable Chat APK
 on:
   workflow_dispatch:
   push:
@@ -34,6 +34,277 @@ jobs:
             "https://huggingface.co/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen_Qwen3-4B-Instruct-2507-IQ3_XS.gguf?download=true" \
             -o llama.cpp/examples/llama.android/app/src/main/assets/local-model.gguf
           ls -lh llama.cpp/examples/llama.android/app/src/main/assets/local-model.gguf
+
+      - name: Configure app
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          root=Path('llama.cpp/examples/llama.android')
+          src=root/'app/src/main'
+          j=src/'java/com/example/llama'
+
+          # Patch upstream llama.android so truncated/cancelled turns do not poison chat history.
+          cpp=root/'lib/src/main/cpp/ai_chat.cpp'
+          cs=cpp.read_text()
+          cs=cs.replace('stop_generation_position = current_position + user_prompt_size + n_predict;','stop_generation_position = current_position + n_predict;')
+          old_stop='    if (current_position >= stop_generation_position) {\n        LOGw("%s: STOP: hitting stop position: %d", __func__, stop_generation_position);\n        return nullptr;\n    }'
+          new_stop='    if (current_position >= stop_generation_position) {\n        LOGw("%s: STOP: hitting stop position: %d", __func__, stop_generation_position);\n        chat_add_and_format(ROLE_ASSISTANT, assistant_ss.str());\n        return nullptr;\n    }'
+          if old_stop not in cs: raise SystemExit('ai_chat.cpp stop block not found')
+          cs=cs.replace(old_stop,new_stop,1)
+          anchor='extern "C"\nJNIEXPORT void JNICALL\nJava_com_arm_aichat_internal_InferenceEngineImpl_unload'
+          finalize='extern "C"\nJNIEXPORT void JNICALL\nJava_com_arm_aichat_internal_InferenceEngineImpl_finalizeAssistantTurn(\n        JNIEnv * /*env*/, jobject /*unused*/) {\n    chat_add_and_format(ROLE_ASSISTANT, assistant_ss.str());\n    reset_short_term_states();\n}\n\n\n'
+          if anchor not in cs: raise SystemExit('ai_chat.cpp unload anchor not found')
+          cs=cs.replace(anchor,finalize+anchor,1)
+          cpp.write_text(cs)
+
+          impl=root/'lib/src/main/java/com/arm/aichat/internal/InferenceEngineImpl.kt'
+          ks=impl.read_text()
+          kt_anchor='    @FastNative\n    private external fun generateNextToken(): String?\n'
+          kt_new='    @FastNative\n    private external fun generateNextToken(): String?\n\n    @FastNative\n    private external fun finalizeAssistantTurn()\n'
+          if kt_anchor not in ks: raise SystemExit('InferenceEngineImpl JNI anchor not found')
+          ks=ks.replace(kt_anchor,kt_new,1)
+          cancel_old='        } catch (e: CancellationException) {\n            Log.i(TAG, "Assistant generation\'s flow collection cancelled.")\n            _state.value = InferenceEngine.State.ModelReady\n            throw e\n'
+          cancel_new='        } catch (e: CancellationException) {\n            Log.i(TAG, "Assistant generation\'s flow collection cancelled.")\n            finalizeAssistantTurn()\n            _state.value = InferenceEngine.State.ModelReady\n            throw e\n'
+          if cancel_old not in ks: raise SystemExit('InferenceEngineImpl cancellation block not found')
+          ks=ks.replace(cancel_old,cancel_new,1)
+          impl.write_text(ks)
+          p=root/'lib/build.gradle.kts'
+          s=p.read_text().replace('abiFilters += listOf("arm64-v8a", "x86_64")','abiFilters += listOf("arm64-v8a")')
+          p.write_text(s)
+
+          p=root/'app/build.gradle.kts'
+          s=p.read_text().replace('targetSdk = 36','targetSdk = 33')
+          if 'nanohttpd' not in s:
+              s=s.replace('implementation(project(":lib"))','implementation(project(":lib"))\n    implementation("org.nanohttpd:nanohttpd:2.3.1")')
+          if 'noCompress += "gguf"' not in s:
+              s=s.replace('    compileOptions {','    androidResources { noCompress += "gguf" }\n    compileOptions {')
+          p.write_text(s)
+
+          p=src/'res/values/strings.xml'
+          s=re.sub(r'<string name="app_name">.*?</string>','<string name="app_name">LocalCryptoAI v2</string>',p.read_text())
+          p.write_text(s)
+
+          p=src/'AndroidManifest.xml'
+          s=p.read_text()
+          s=s.replace('    <application','    <uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <application',1)
+          s=s.replace('        <activity','        <service android:name=".LocalAiService" android:exported="false" android:stopWithTask="false" />\n        <activity',1)
+          p.write_text(s)
+
+          (j/'LocalAiRuntime.kt').write_text('''package com.example.llama
+          import android.content.Context
+          import com.arm.aichat.AiChat
+          import com.arm.aichat.InferenceEngine
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.coroutines.flow.collect
+          import kotlinx.coroutines.flow.flow
+          import kotlinx.coroutines.sync.Mutex
+          import kotlinx.coroutines.sync.withLock
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.io.FileOutputStream
+
+          object LocalAiRuntime {
+              const val MODEL_ID="qwen3-4b-instruct-2507-iq3-xs"
+              const val PORT=8787
+              @Volatile var ready=false
+              @Volatile var error:String?=null
+              private lateinit var engine:InferenceEngine
+              private val lock=Mutex()
+              private const val SYS="You are LocalCryptoAI, a general-purpose on-device assistant. Answer ordinary questions normally in the user's language. Do not require live market data unless the user asks for a current-data trading decision. Do not output JSON unless requested. Never invent live prices, indicators, news, positions, or account data. If structured trading data is provided, analyze only that data and clearly state uncertainty."
+
+              suspend fun init(c:Context)=lock.withLock {
+                  if(ready) return@withLock
+                  try {
+                      engine=AiChat.getInferenceEngine(c.applicationContext)
+                      val d=File(c.filesDir,"models").apply{mkdirs()}
+                      val f=File(d,"qwen3-4b-iq3xs.gguf")
+                      if(!f.exists() || f.length()<1_000_000_000L) withContext(Dispatchers.IO){
+                          c.assets.open("local-model.gguf").use{a->FileOutputStream(f).use{a.copyTo(it,1024*1024)}}
+                      }
+                      engine.loadModel(f.path)
+                      engine.setSystemPrompt(SYS)
+                      ready=true
+                  } catch(t:Throwable){ error=t.message?:t.javaClass.simpleName; throw t }
+              }
+
+              fun stream(q:String,n:Int=512):Flow<String> = flow {
+                  check(ready){"Local AI is not ready"}
+                  lock.withLock {
+                      engine.sendUserPrompt(q,n.coerceIn(16,1024)).collect{emit(it)}
+                  }
+              }
+
+              suspend fun chat(q:String,n:Int=512):String {
+                  val b=StringBuilder()
+                  stream(q,n).collect{b.append(it)}
+                  return b.toString()
+              }
+
+              fun stateName():String = if(!::engine.isInitialized) "starting" else engine.state.value.javaClass.simpleName
+              fun destroy(){ if(::engine.isInitialized) runCatching{engine.destroy()}; ready=false }
+          }
+          '''.replace('\n          ','\n').lstrip())
+
+          (j/'LocalHttpServer.kt').write_text('''package com.example.llama
+          import fi.iki.elonen.NanoHTTPD
+          import kotlinx.coroutines.runBlocking
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.util.UUID
+
+          class LocalHttpServer: NanoHTTPD("127.0.0.1",LocalAiRuntime.PORT) {
+              override fun serve(s:IHTTPSession):Response {
+                  if(s.method==Method.GET && s.uri=="/health") return json(200,JSONObject().put("ready",LocalAiRuntime.ready).put("model",LocalAiRuntime.MODEL_ID).put("port",LocalAiRuntime.PORT).put("error",LocalAiRuntime.error).toString())
+                  if(s.method==Method.GET && s.uri=="/v1/models") return json(200,JSONObject().put("object","list").put("data",JSONArray().put(JSONObject().put("id",LocalAiRuntime.MODEL_ID).put("object","model"))).toString())
+                  if(!LocalAiRuntime.ready) return json(503,JSONObject().put("error","model_loading").toString())
+                  val body=HashMap<String,String>(); if(s.method==Method.POST) s.parseBody(body)
+                  val raw=body["postData"]?:"{}"
+                  return when {
+                      s.method==Method.POST && s.uri=="/v1/chat/completions" -> chat(raw)
+                      s.method==Method.POST && s.uri=="/v1/analysis" -> analyze(raw)
+                      else -> json(404,"{\\"error\\":\\"not_found\\"}")
+                  }
+              }
+
+              private fun chat(raw:String):Response {
+                  val o=JSONObject(raw); val a=o.optJSONArray("messages")?:JSONArray(); val p=StringBuilder()
+                  for(i in 0 until a.length()){val m=a.optJSONObject(i)?:continue;p.append(m.optString("role","user")).append(": ").append(m.optString("content","")).append("\\n")}
+                  if(p.isEmpty()) return json(400,"{\\"error\\":\\"messages_empty\\"}")
+                  val ans=runBlocking{LocalAiRuntime.chat(p.toString(),o.optInt("max_tokens",512))}
+                  val choice=JSONObject().put("index",0).put("message",JSONObject().put("role","assistant").put("content",ans)).put("finish_reason","stop")
+                  return json(200,JSONObject().put("id","chatcmpl-local-${UUID.randomUUID()}").put("object","chat.completion").put("model",LocalAiRuntime.MODEL_ID).put("choices",JSONArray().put(choice)).toString())
+              }
+
+              private fun analyze(raw:String):Response {
+                  val o=JSONObject(raw); val q="Analyze this independent request. Return strict JSON only. Do not invent missing data. Task: ${o.optString("task","analyze")}\\nInput: $o"
+                  val ans=runBlocking{LocalAiRuntime.chat(q,o.optInt("max_tokens",512))}
+                  return json(200,JSONObject().put("model",LocalAiRuntime.MODEL_ID).put("result",ans).toString())
+              }
+
+              private fun json(code:Int,s:String)=newFixedLengthResponse(when(code){200->Response.Status.OK;400->Response.Status.BAD_REQUEST;404->Response.Status.NOT_FOUND;503->Response.Status.SERVICE_UNAVAILABLE;else->Response.Status.INTERNAL_ERROR},"application/json; charset=utf-8",s)
+          }
+          '''.replace('\n          ','\n').lstrip())
+
+          (j/'LocalAiService.kt').write_text('''package com.example.llama
+          import android.app.*
+          import android.content.Intent
+          import android.os.IBinder
+          import kotlinx.coroutines.*
+
+          class LocalAiService:Service(){
+              private val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
+              private var server:LocalHttpServer?=null
+              override fun onCreate(){super.onCreate();channel();startForeground(1001,note("Loading Qwen3 4B…"));server=LocalHttpServer().also{it.start()};scope.launch{try{LocalAiRuntime.init(applicationContext);getSystemService(NotificationManager::class.java).notify(1001,note("Ready · 127.0.0.1:8787"))}catch(t:Throwable){getSystemService(NotificationManager::class.java).notify(1001,note("Failed: ${t.message}"))}}}
+              override fun onStartCommand(i:Intent?,f:Int,id:Int)=START_STICKY
+              override fun onBind(i:Intent?):IBinder?=null
+              override fun onDestroy(){server?.stop();LocalAiRuntime.destroy();scope.cancel();super.onDestroy()}
+              private fun channel(){getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("localai","Local AI",NotificationManager.IMPORTANCE_LOW))}
+              private fun note(t:String):Notification{val p=PendingIntent.getActivity(this,0,Intent(this,MainActivity::class.java),PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT);return Notification.Builder(this,"localai").setSmallIcon(android.R.drawable.stat_sys_download_done).setContentTitle("LocalCryptoAI v2").setContentText(t).setOngoing(true).setContentIntent(p).build()}
+          }
+          '''.replace('\n          ','\n').lstrip())
+
+          (j/'MainActivity.kt').write_text('''package com.example.llama
+          import android.content.Intent
+          import android.os.Bundle
+          import android.os.SystemClock
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.lifecycle.lifecycleScope
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.flow.collect
+
+          class MainActivity:AppCompatActivity(){
+              private lateinit var status:TextView
+              private lateinit var out:TextView
+              private lateinit var input:EditText
+              private lateinit var send:Button
+              private lateinit var stop:Button
+              private lateinit var scroll:ScrollView
+              private var job:Job?=null
+
+              override fun onCreate(b:Bundle?){
+                  super.onCreate(b); ui()
+                  startForegroundService(Intent(this,LocalAiService::class.java))
+                  lifecycleScope.launch{
+                      while(!LocalAiRuntime.ready&&LocalAiRuntime.error==null)delay(500)
+                      status.text=if(LocalAiRuntime.ready)"● Qwen3 4B ready · API 127.0.0.1:8787" else "Failed: ${LocalAiRuntime.error}"
+                      send.isEnabled=LocalAiRuntime.ready
+                  }
+                  send.setOnClickListener{ask()}
+                  stop.setOnClickListener{job?.cancel()}
+              }
+
+              private fun ui(){
+                  val root=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(32,48,32,24)}
+                  status=TextView(this).apply{text="Loading local model…"}
+                  out=TextView(this).apply{textSize=16f}
+                  scroll=ScrollView(this).apply{addView(out);layoutParams=LinearLayout.LayoutParams(-1,0,1f)}
+                  input=EditText(this).apply{hint="輸入訊息…"}
+                  val row=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL}
+                  send=Button(this).apply{text="送出";isEnabled=false;layoutParams=LinearLayout.LayoutParams(0,-2,1f)}
+                  stop=Button(this).apply{text="停止";isEnabled=false;layoutParams=LinearLayout.LayoutParams(0,-2,1f)}
+                  row.addView(send);row.addView(stop)
+                  root.addView(status);root.addView(scroll);root.addView(input);root.addView(row);setContentView(root)
+              }
+
+              private fun ask(){
+                  val q=input.text.toString().trim(); if(q.isEmpty())return
+                  input.text.clear(); send.isEnabled=false; stop.isEnabled=true
+                  out.append("\n你：$q\nAI："); scroll.post{scroll.fullScroll(ScrollView.FOCUS_DOWN)}
+                  val started=SystemClock.elapsedRealtime()
+                  var chunks=0
+                  job=lifecycleScope.launch {
+                      try{
+                          withTimeout(180000){
+                              LocalAiRuntime.stream(q,512).collect{t->
+                                  chunks++
+                                  out.append(t)
+                                  val sec=((SystemClock.elapsedRealtime()-started)/1000).coerceAtLeast(1)
+                                  status.text="● 生成中 · $chunks chunks · ${sec}s · ${LocalAiRuntime.stateName()}"
+                                  scroll.post{scroll.fullScroll(ScrollView.FOCUS_DOWN)}
+                              }
+                          }
+                      }catch(_:CancellationException){
+                          out.append(" [已停止]")
+                      }catch(t:Throwable){
+                          out.append(" [錯誤：${t.message?:t.javaClass.simpleName}]")
+                      }finally{
+                          out.append("\n")
+                          status.text="● Qwen3 4B ready · API 127.0.0.1:8787"
+                          send.isEnabled=LocalAiRuntime.ready; stop.isEnabled=false
+                          scroll.post{scroll.fullScroll(ScrollView.FOCUS_DOWN)}
+                      }
+                  }
+              }
+          }
+          '''.replace('\n          ','\n').lstrip())
+          PY
+
+      - name: Build APK
+        working-directory: llama.cpp/examples/llama.android
+        env:
+          GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx7g
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/LocalCryptoAI-v2-Qwen3-4B-IQ3XS-arm64.apk"
+          ls -lh "$GITHUB_WORKSPACE/LocalCryptoAI-v2-Qwen3-4B-IQ3XS-arm64.apk"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import os
+          p='LocalCryptoAI-v2-Qwen3-4B-IQ3XS-arm64.apk'; n=os.path.getsize(p); print(f'APK bytes: {n:,}')
+          if n>=2_147_000_000: raise SystemExit('APK too large for GitHub Release asset')
+          PY
+          TAG="localai-v2-build-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" "LocalCryptoAI-v2-Qwen3-4B-IQ3XS-arm64.apk" \
+            --title "LocalCryptoAI v2.2 build ${GITHUB_RUN_NUMBER}" \
+            --notes "Qwen3 4B offline Android v2.2. Fixes truncated-turn chat history, streams tokens, and keeps local API on 127.0.0.1:8787."
 
       - name: Configure app
         run: |
